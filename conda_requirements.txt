@@ -1,0 +1,29 @@
+###### Requirements with Version Specifiers ######
+numpy ==1.23
+numba >=0.55.2
+scipy >=1.8.1
+matplotlib >=3.5.2
+emcee >=3.1.2
+astropy >=5.1
+astroquery >=0.4
+pyerfa >=2.0
+jaxlib >=0.3.15
+jax >=0.3.15
+tinygp >=0.2.2
+###### Requirements without Version Specifiers ######
+argparse
+pyyaml
+h5py
+tqdm
+pygtc
+PyDE @ git+https://github.com/hpparvi/PyDE.git
+batman-package
+transitleastsquares
+ldtk
+arviz
+corner
+###### Additional packages
+pytransit >= 2.5.21
+dynesty >= 2.0.1
+pyastronomy
+opencv-python
