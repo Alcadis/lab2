@@ -49,13 +49,19 @@ class AperturePhotometry:
     def correct_science_frame(self, science_data):
         """Correct science frame for bias and flat-fielding."""
         science_debiased = science_data - self.median_bias
-        science_corrected = science_debiased / self.median_normalized_flat
-
+        
+        # Avoid divide-by-zero by replacing zeros with a small positive value
+        corrected_flat = np.where(self.median_normalized_flat == 0, 1e-10, self.median_normalized_flat)
+        science_corrected = science_debiased / corrected_flat
+        
         # Error computation
-        science_debiased_errors = np.sqrt(self.readout_noise**2 + self.median_bias_error**2 + science_debiased)
+        science_debiased_errors = np.sqrt(
+            self.readout_noise**2 + self.median_bias_error**2 + science_debiased
+        )
+        flat_error = np.where(self.median_normalized_flat_error == 0, 1e-10, self.median_normalized_flat_error)
         science_corrected_errors = science_corrected * np.sqrt(
-            (science_debiased_errors / science_debiased)**2 + 
-            (self.median_normalized_flat_error / self.median_normalized_flat)**2
+            (science_debiased_errors / science_debiased)**2 +
+            (flat_error / corrected_flat)**2
         )
 
         return science_corrected, science_corrected_errors
@@ -79,7 +85,47 @@ class AperturePhotometry:
 
             x_refined, y_refined = x_new, y_new
 
+        self.x_refined = x_refined
+        self.y_refined = y_refined
+
         return x_refined, y_refined
+
+    def compute_fwhm(self, science_frame, x_pos, y_pos):
+        """Compute FWHM of the star along the x and y axes."""
+        from scipy.interpolate import interp1d
+    
+        # Extract profiles along x and y axes
+        x_profile = science_frame[int(y_pos), :]
+        y_profile = science_frame[:, int(x_pos)]
+        
+        # Find the maximum values
+        x_max = np.max(x_profile)
+        y_max = np.max(y_profile)
+        
+        # Define half-max values
+        x_half_max = x_max / 2
+        y_half_max = y_max / 2
+        
+        # Interpolate to find the positions where profile crosses half max
+        def fwhm(profile, half_max):
+            indices = np.arange(len(profile))
+            above_half = np.where(profile > half_max)[0]
+            if len(above_half) < 2:  # No clear FWHM
+                return 0
+            left_idx = above_half[0]
+            right_idx = above_half[-1]
+            f_interp = interp1d(profile[left_idx:right_idx+1], indices[left_idx:right_idx+1])
+            try:
+                left = f_interp(half_max)
+                right = f_interp(half_max)
+                return right - left
+            except ValueError:
+                return 0
+        
+        x_fwhm = fwhm(x_profile, x_half_max)
+        y_fwhm = fwhm(y_profile, y_half_max)
+    
+        return x_fwhm, y_fwhm
 
     def compute_sky_background(self, science_frame, x_pos, y_pos):
         """Calculate sky background using an annulus."""
@@ -118,14 +164,16 @@ class AperturePhotometry:
         self.exptime = np.empty(self.science_size)
         self.julian_date = np.empty(self.science_size)
         self.bjd_tdb = np.empty(self.science_size)
-
+    
         self.sky_background = np.empty(self.science_size)
         self.sky_background_errors = np.empty(self.science_size)
         self.aperture = np.empty(self.science_size)
         self.aperture_errors = np.empty(self.science_size)
         self.x_position = np.empty(self.science_size)
         self.y_position = np.empty(self.science_size)
-
+        self.x_fwhm = np.empty(self.science_size, dtype=float)  # Initialize x_fwhm array
+        self.y_fwhm = np.empty(self.science_size, dtype=float)  # Initialize y_fwhm array
+    
         for i, science_name in enumerate(self.science_list):
             # Load science frame
             science_fits = fits.open(self.science_path + science_name)
@@ -134,33 +182,38 @@ class AperturePhotometry:
             self.julian_date[i] = science_fits[0].header['JD']
             science_data = science_fits[0].data * self.gain
             science_fits.close()
-
+    
             # Correct science frame
             science_corrected, science_corrected_errors = self.correct_science_frame(science_data)
-
+    
             # Compute sky background
             sky_median, sky_error = self.compute_sky_background(science_corrected, self.x_initial, self.y_initial)
             self.sky_background[i] = sky_median
             self.sky_background_errors[i] = sky_error
-
+    
             # Subtract sky background
             science_sky_corrected = science_corrected - sky_median
-
+    
             # Compute refined centroid
             x_refined, y_refined = self.compute_centroid(science_sky_corrected, self.x_initial, self.y_initial)
-
+    
+            # Compute FWHM
+            x_fwhm, y_fwhm = self.compute_fwhm(science_sky_corrected, x_refined, y_refined)
+            self.x_fwhm[i] = float(x_fwhm)
+            self.y_fwhm[i] = float(y_fwhm)
+            
             # Perform aperture photometry
             target_distance = np.sqrt((self.X - x_refined)**2 + (self.Y - y_refined)**2)
             aperture_selection = (target_distance < self.aperture_radius)
             self.aperture[i] = np.sum(science_sky_corrected[aperture_selection])
-
+    
             # Estimate error
             self.aperture_errors[i] = np.sqrt(np.sum(science_corrected_errors[aperture_selection]**2))
-
+    
             # Save positions
             self.x_position[i] = x_refined
             self.y_position[i] = y_refined
-
+    
         # Convert JD to BJD_TDB
         self.bjd_tdb = self.convert_bjd_tdb(self.julian_date, self.exptime)
 
@@ -174,6 +227,8 @@ class AperturePhotometry:
             'aperture': self.aperture,
             'x_position': self.x_position,
             'y_position': self.y_position,
+            'x_fwhm': self.x_fwhm,
+            'y_fwhm': self.y_fwhm,
         }
         with open(filename, 'wb') as f:
             pickle.dump(results, f)
