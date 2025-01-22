@@ -11,7 +11,7 @@ from astropy import units as u
 
 class AperturePhotometry:
     def __init__(self):
-        self.data_path = '/home/alcadis/Desktop/lab2/group13_WASP-12_20230113'
+        self.data_path = '../group13_WASP-12_20230113'
 
         # Constants
         self.readout_noise = 7.4
@@ -19,10 +19,10 @@ class AperturePhotometry:
         self.bias_std = 1.3
 
         # Loading calibration files
-        self.median_bias = pickle.load(open('/home/alcadis/Desktop/lab2/TASTE_analysis/median_bias.p', 'rb'))
-        self.median_bias_error = pickle.load(open('/home/alcadis/Desktop/lab2/TASTE_analysis/median_bias_error.p', 'rb'))
-        self.median_normalized_flat = pickle.load(open('/home/alcadis/Desktop/lab2/TASTE_analysis/median_normalized_flat.p', 'rb'))
-        self.median_normalized_flat_error = pickle.load(open('/home/alcadis/Desktop/lab2/TASTE_analysis/median_normalized_flat_errors.p', 'rb'))
+        self.median_bias = pickle.load(open('median_bias.p', 'rb'))
+        self.median_bias_error = pickle.load(open('median_bias_error.p', 'rb'))
+        self.median_normalized_flat = pickle.load(open('median_normalized_flat.p', 'rb'))
+        self.median_normalized_flat_error = pickle.load(open('median_normalized_flat_errors.p', 'rb'))
 
         # Science files
         self.science_path = self.data_path + '/science/'
@@ -38,6 +38,65 @@ class AperturePhotometry:
         X_axis = np.arange(0, xlen, 1.)
         Y_axis = np.arange(0, ylen, 1.)
         self.X, self.Y = np.meshgrid(X_axis, Y_axis)
+
+    def aperture_photometry(self):
+        """Perform aperture photometry for all science frames."""
+        # Initialize result arrays
+        self.airmass = np.empty(self.science_size)
+        self.exptime = np.empty(self.science_size)
+        self.julian_date = np.empty(self.science_size)
+        self.bjd_tdb = np.empty(self.science_size)
+    
+        self.sky_background = np.empty(self.science_size)
+        self.sky_background_errors = np.empty(self.science_size)
+        self.aperture = np.empty(self.science_size)
+        self.aperture_errors = np.empty(self.science_size)
+        self.x_position = np.empty(self.science_size)
+        self.y_position = np.empty(self.science_size)
+        self.x_fwhm = np.empty(self.science_size, dtype=float)  # Initialize x_fwhm array
+        self.y_fwhm = np.empty(self.science_size, dtype=float)  # Initialize y_fwhm array
+    
+        for i, science_name in enumerate(self.science_list):
+            # Load science frame
+            science_fits = fits.open(self.science_path + science_name)
+            self.airmass[i] = science_fits[0].header['AIRMASS']
+            self.exptime[i] = science_fits[0].header['EXPTIME']
+            self.julian_date[i] = science_fits[0].header['JD']
+            science_data = science_fits[0].data * self.gain
+            science_fits.close()
+    
+            # Correct science frame
+            science_corrected, science_corrected_error = self.correct_science_frame(science_data)
+    
+            # Compute sky background
+            sky_median, sky_error = self.compute_sky_background(science_corrected, science_corrected_error, self.x_initial, self.y_initial)
+            self.sky_background[i] = sky_median
+            self.sky_background_errors[i] = sky_error
+    
+            # Subtract sky background
+            science_sky_corrected = science_corrected - sky_median
+            science_sky_corrected_error = np.sqrt(science_corrected_error**2 + sky_error**2)
+    
+            # Compute refined centroid
+            x_refined, y_refined = self.compute_centroid(science_sky_corrected, self.x_initial, self.y_initial)
+    
+            # Compute FWHM
+            x_fwhm, y_fwhm = self.compute_fwhm(science_sky_corrected, x_refined, y_refined)
+            self.x_fwhm[i] = float(x_fwhm)
+            self.y_fwhm[i] = float(y_fwhm)
+            
+            # Perform aperture photometry
+            target_distance = np.sqrt((self.X - x_refined)**2 + (self.Y - y_refined)**2)
+            aperture_selection = (target_distance < self.aperture_radius)
+            self.aperture[i] = np.sum(science_sky_corrected[aperture_selection])
+            self.aperture_errors[i] = np.sqrt(np.sum(science_sky_corrected_error[aperture_selection]**2))
+    
+            # Save positions
+            self.x_position[i] = x_refined
+            self.y_position[i] = y_refined
+    
+        # Convert JD to BJD_TDB
+        self.bjd_tdb = self.convert_bjd_tdb(self.julian_date, self.exptime)
 
     def provide_aperture_parameters(self, sky_inner_radius, sky_outer_radius, aperture_radius, x_initial, y_initial):
         self.sky_inner_radius = sky_inner_radius
@@ -127,14 +186,16 @@ class AperturePhotometry:
     
         return x_fwhm, y_fwhm
 
-    def compute_sky_background(self, science_frame, x_pos, y_pos):
+    def compute_sky_background(self, science_frame, science_frame_error, x_pos, y_pos):
         """Calculate sky background using an annulus."""
         target_distance = np.sqrt((self.X - x_pos)**2 + (self.Y - y_pos)**2)
         annulus_selection = (target_distance > self.sky_inner_radius) & (target_distance <= self.sky_outer_radius)
 
         sky_flux_median = np.median(science_frame[annulus_selection])
+
+        sky_flux_error = np.sqrt(np.sum(science_frame_error[annulus_selection]**2))/np.size(annulus_selection)
         
-        return sky_flux_median, np.std(science_frame[annulus_selection])
+        return sky_flux_median, sky_flux_error
 
     def convert_bjd_tdb(self, jd_array, exptime_array):
         """Convert Julian Date (JD) to Barycentric Julian Date in Barycentric Dynamical Time (BJD_TDB)."""
@@ -156,66 +217,6 @@ class AperturePhotometry:
         except Exception as e:
             print(f"Error in convert_bjd_tdb: {e}")
             raise
-
-    def aperture_photometry(self):
-        """Perform aperture photometry for all science frames."""
-        # Initialize result arrays
-        self.airmass = np.empty(self.science_size)
-        self.exptime = np.empty(self.science_size)
-        self.julian_date = np.empty(self.science_size)
-        self.bjd_tdb = np.empty(self.science_size)
-    
-        self.sky_background = np.empty(self.science_size)
-        self.sky_background_errors = np.empty(self.science_size)
-        self.aperture = np.empty(self.science_size)
-        self.aperture_errors = np.empty(self.science_size)
-        self.x_position = np.empty(self.science_size)
-        self.y_position = np.empty(self.science_size)
-        self.x_fwhm = np.empty(self.science_size, dtype=float)  # Initialize x_fwhm array
-        self.y_fwhm = np.empty(self.science_size, dtype=float)  # Initialize y_fwhm array
-    
-        for i, science_name in enumerate(self.science_list):
-            # Load science frame
-            science_fits = fits.open(self.science_path + science_name)
-            self.airmass[i] = science_fits[0].header['AIRMASS']
-            self.exptime[i] = science_fits[0].header['EXPTIME']
-            self.julian_date[i] = science_fits[0].header['JD']
-            science_data = science_fits[0].data * self.gain
-            science_fits.close()
-    
-            # Correct science frame
-            science_corrected, science_corrected_errors = self.correct_science_frame(science_data)
-    
-            # Compute sky background
-            sky_median, sky_error = self.compute_sky_background(science_corrected, self.x_initial, self.y_initial)
-            self.sky_background[i] = sky_median
-            self.sky_background_errors[i] = sky_error
-    
-            # Subtract sky background
-            science_sky_corrected = science_corrected - sky_median
-    
-            # Compute refined centroid
-            x_refined, y_refined = self.compute_centroid(science_sky_corrected, self.x_initial, self.y_initial)
-    
-            # Compute FWHM
-            x_fwhm, y_fwhm = self.compute_fwhm(science_sky_corrected, x_refined, y_refined)
-            self.x_fwhm[i] = float(x_fwhm)
-            self.y_fwhm[i] = float(y_fwhm)
-            
-            # Perform aperture photometry
-            target_distance = np.sqrt((self.X - x_refined)**2 + (self.Y - y_refined)**2)
-            aperture_selection = (target_distance < self.aperture_radius)
-            self.aperture[i] = np.sum(science_sky_corrected[aperture_selection])
-    
-            # Estimate error
-            self.aperture_errors[i] = np.sqrt(np.sum(science_corrected_errors[aperture_selection]**2))
-    
-            # Save positions
-            self.x_position[i] = x_refined
-            self.y_position[i] = y_refined
-    
-        # Convert JD to BJD_TDB
-        self.bjd_tdb = self.convert_bjd_tdb(self.julian_date, self.exptime)
 
     def save_results(self, filename):
         """Save the photometry results to a file."""
